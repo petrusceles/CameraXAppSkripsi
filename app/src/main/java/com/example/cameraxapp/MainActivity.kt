@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.hardware.camera2.CameraCharacteristics
 import android.os.Build
 import android.os.Bundle
@@ -20,7 +21,7 @@ import java.util.concurrent.Executors
 import android.widget.Toast
 import androidx.camera.lifecycle.ProcessCameraProvider
 import android.util.Log
-import android.util.Size
+import android.view.Surface.ROTATION_90
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.*
@@ -31,11 +32,8 @@ import androidx.camera.video.MediaStoreOutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.VideoRecordEvent
-import androidx.core.content.ContentProviderCompat.requireContext
 import androidx.core.content.PermissionChecker
 import com.example.cameraxapp.databinding.ActivityMainBinding
-import org.tensorflow.lite.examples.objectdetection.ObjectDetectorHelper
-import org.tensorflow.lite.task.gms.vision.detector.Detection
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -43,7 +41,7 @@ import java.util.Locale
 typealias LumaListener = (luma: Double) -> Unit
 
 
-class MainActivity : AppCompatActivity(), ObjectDetectorHelper.DetectorListener {
+class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
 
     private var imageCapture: ImageCapture? = null
@@ -53,30 +51,7 @@ class MainActivity : AppCompatActivity(), ObjectDetectorHelper.DetectorListener 
 
     private lateinit var cameraExecutor: ExecutorService
 
-    private lateinit var bitmapBuffer: Bitmap
-    private lateinit var objectDetectorHelper: ObjectDetectorHelper
-//    private class LuminosityAnalyzer(private val listener: LumaListener) : ImageAnalysis.Analyzer {
-//
-//        private fun ByteBuffer.toByteArray(): ByteArray {
-//            rewind()    // Rewind the buffer to zero
-//            val data = ByteArray(remaining())
-//            get(data)   // Copy the buffer into a byte array
-//            return data // Return the byte array
-//        }
-//
-//        override fun analyze(image: ImageProxy) {
-//
-//            val buffer = image.planes[0].buffer
-//            val data = buffer.toByteArray()
-//            val pixels = data.map { it.toInt() and 0xFF }
-//            val luma = pixels.average()
-//
-//            listener(luma)
-//
-//            image.close()
-//        }
-//    }
-
+    private lateinit var objectDetector: ObjectDetector
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         viewBinding = ActivityMainBinding.inflate(layoutInflater)
@@ -90,13 +65,13 @@ class MainActivity : AppCompatActivity(), ObjectDetectorHelper.DetectorListener 
                 this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
 
+
+
         // Set up the listeners for take photo and video capture buttons
         viewBinding.imageCaptureButton.setOnClickListener { takePhoto() }
         viewBinding.videoCaptureButton.setOnClickListener { captureVideo() }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-
-        objectDetectorHelper = ObjectDetectorHelper(context = this, objectDetectorListener = this)
     }
 
     private fun takePhoto() {
@@ -217,6 +192,8 @@ class MainActivity : AppCompatActivity(), ObjectDetectorHelper.DetectorListener 
             // Used to bind the lifecycle of cameras to the lifecycle owner
             val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
 
+
+
             // Preview
             val preview = Preview.Builder()
                 .setTargetRotation(viewBinding.viewFinder.display.rotation)
@@ -229,27 +206,19 @@ class MainActivity : AppCompatActivity(), ObjectDetectorHelper.DetectorListener 
             val imageAnalyzer =
                 ImageAnalysis.Builder()
                     .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-                    .setTargetRotation(viewBinding.viewFinder.display.rotation)
+                    .setTargetRotation(ROTATION_90)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .build()
-                    // The analyzer can then be assigned to the instance
-                    .also {
-                        it.setAnalyzer(cameraExecutor) { image ->
-                            if (!::bitmapBuffer.isInitialized) {
-                                // The image rotation and RGB image buffer are initialized only once
-                                // the analyzer has started running
-                                bitmapBuffer = Bitmap.createBitmap(
-                                    image.width,
-                                    image.height,
-                                    Bitmap.Config.ARGB_8888
-                                )
-                            }
 
-                            detectObjects(image)
-                        }
-                    }
-
+            imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(this)
+            ) { image ->
+                objectDetector =  ObjectDetector(this,"halo.tflite")
+                val bitmapImage = imageProxyToBitmap(image)
+                val detectionResult: List<DetectedObject> =
+                    objectDetector.detectObjects((bitmapImage))
+                Log.i("Detection Result", detectionResult.toString())
+            }
 
             val selector = QualitySelector
                 .from(
@@ -292,6 +261,28 @@ class MainActivity : AppCompatActivity(), ObjectDetectorHelper.DetectorListener 
         }, ContextCompat.getMainExecutor(this))
     }
 
+    private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
+        // Get the image's dimensions
+        val width = image.width
+        val height = image.height
+
+        // Create a new bitmap
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+
+        // Create a buffer with the correct size
+        val buffer = image.planes[0].buffer
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
+
+        // Copy the buffer into the bitmap's pixels
+        bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(bytes))
+
+        // Rotate the bitmap to the correct orientation
+        val matrix = Matrix()
+        matrix.postRotate(image.imageInfo.rotationDegrees.toFloat())
+        return Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, true)
+    }
+    
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(
             baseContext, it) == PackageManager.PERMISSION_GRANTED
@@ -332,42 +323,6 @@ class MainActivity : AppCompatActivity(), ObjectDetectorHelper.DetectorListener 
                 finish()
             }
         }
-    }
-    private fun detectObjects(image: ImageProxy) {
-        // Copy out RGB bits to the shared bitmap buffer
-        image.use { bitmapBuffer.copyPixelsFromBuffer(image.planes[0].buffer) }
-
-        val imageRotation = image.imageInfo.rotationDegrees
-        Log.i("ROTATION", imageRotation.toString())
-        // Pass Bitmap and rotation to the object detector helper for processing and detection
-        objectDetectorHelper.detect(bitmapBuffer, imageRotation)
-    }
-    override fun onInitialized() {
-        objectDetectorHelper.setupObjectDetector()
-        // Initialize our background executor
-        cameraExecutor = Executors.newSingleThreadExecutor()
-
-        // Wait for the views to be properly laid out
-        viewBinding.viewFinder.post {
-            // Set up the camera and its use cases
-            startCamera()
-        }
-    }
-
-    override fun onError(error: String) {
-        Log.e("APP", error)
-//        activity?.runOnUiThread {
-//            Toast.makeText(requireContext(), error, Toast.LENGTH_SHORT).show()
-//        }
-    }
-
-    override fun onResults(
-        results: MutableList<Detection>?,
-        inferenceTime: Long,
-        imageHeight: Int,
-        imageWidth: Int
-    ) {
-        Log.i("Result", "Success")
     }
 
 }

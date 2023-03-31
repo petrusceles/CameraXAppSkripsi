@@ -8,6 +8,7 @@ import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import java.util.*
 
 
 private const val INPUT_IMAGE_SIZE = 640
@@ -27,9 +28,7 @@ class ObjectDetector(context: Context, private val modelPath: String) {
     }
 
     private fun loadModelFile(context: Context): MappedByteBuffer {
-        Log.i("LOAD MODEL FILE", modelPath)
         val fileDescriptor = context.assets.openFd(modelPath)
-        Log.e("File Descriptor", fileDescriptor.toString() )
         val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
         val fileChannel = inputStream.channel
         val startOffset = fileDescriptor.startOffset
@@ -37,48 +36,68 @@ class ObjectDetector(context: Context, private val modelPath: String) {
         return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
     }
 
-    fun detectObjects(bitmap: Bitmap): List<DetectedObject> {
-        val inputArray = arrayOf(bitmap.toNormalizedFloatArray(INPUT_IMAGE_SIZE))
-        val outputMap = mutableMapOf<Int, Any>()
-        val outputLocations = Array(1) { Array(MAX_DETECTION_RESULTS) { FloatArray(4) } }
-        val outputClasses = Array(1) { FloatArray(MAX_DETECTION_RESULTS) }
-        val outputScores = Array(1) { FloatArray(MAX_DETECTION_RESULTS) }
-        val numDetections = FloatArray(1)
-        outputMap[0] = outputLocations
-        outputMap[1] = outputClasses
-        outputMap[2] = outputScores
-        outputMap[3] = numDetections
-        interpreter.runForMultipleInputsOutputs(inputArray, outputMap)
-        val detectionObjects = mutableListOf<DetectedObject>()
-        val numDetection = numDetections[0].toInt()
-        for (i in 0 until numDetection) {
-            val classId = outputClasses[0][i].toInt()
-            val score = outputScores[0][i]
-            val detection = RectF(
-                outputLocations[0][i][1] * bitmap.width,
-                outputLocations[0][i][0] * bitmap.height,
-                outputLocations[0][i][3] * bitmap.width,
-                outputLocations[0][i][2] * bitmap.height
-            )
-            detectionObjects.add(DetectedObject(classId, score, detection))
-        }
-        return detectionObjects
-    }
+//    fun detectObjects(bitmap: Bitmap): List<DetectedObject> {
+//        val inputTensorShape = interpreter.getInputTensor(0).shape()
+//        val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputTensorShape[2], inputTensorShape[1], true)
+//        val inputArray = arrayOf(resizedBitmap.toNormalizedFloatArray(inputTensorShape[1], inputTensorShape[2]))
+//        val outputMap = mutableMapOf<Int, Any>()
+//        val outputLocations = Array(1) { Array(MAX_DETECTION_RESULTS) { FloatArray(4) } }
+//        val outputClasses = Array(1) { FloatArray(MAX_DETECTION_RESULTS) }
+//        val outputScores = Array(1) { FloatArray(MAX_DETECTION_RESULTS) }
+//        val numDetections = FloatArray(1)
+//        outputMap[0] = outputLocations
+//        outputMap[1] = outputClasses
+//        outputMap[2] = outputScores
+//        outputMap[3] = numDetections
+////        Log.d("GET INPUT TENSOR", interpreter.getInputTensor(0).shape().toString())
+//
+//        interpreter.runForMultipleInputsOutputs(inputArray, outputMap)
+//        val detectionObjects = mutableListOf<DetectedObject>()
+//        val numDetection = numDetections[0].toInt()
+//        for (i in 0 until numDetection) {
+//            val classId = outputClasses[0][i].toInt()
+//            val score = outputScores[0][i]
+//            val detection = RectF(
+//                outputLocations[0][i][1] * bitmap.width,
+//                outputLocations[0][i][0] * bitmap.height,
+//                outputLocations[0][i][3] * bitmap.width,
+//                outputLocations[0][i][2] * bitmap.height
+//            )
+//            detectionObjects.add(DetectedObject(classId, score, detection))
+//        }
+//        return detectionObjects
+//    }
 
-    private fun Bitmap.toNormalizedFloatArray(inputSize: Int): FloatArray {
-        // Create a new bitmap with the specified size and normalize the pixel values
-        val inputBitmap = Bitmap.createScaledBitmap(this, inputSize, inputSize, false)
-        val inputArray = FloatArray(inputSize * inputSize * 3)
-        var pixel = 0
-        for (i in 0 until inputSize) {
-            for (j in 0 until inputSize) {
-                val pixelValue = inputBitmap.getPixel(j, i)
-                // Normalize the pixel values to the range of [0, 1]
-                inputArray[pixel++] = ((pixelValue shr 16 and 0xFF) - IMAGE_MEAN[0]) / IMAGE_STD[0]
-                inputArray[pixel++] = ((pixelValue shr 8 and 0xFF) - IMAGE_MEAN[1]) / IMAGE_STD[1]
-                inputArray[pixel++] = ((pixelValue and 0xFF) - IMAGE_MEAN[2]) / IMAGE_STD[2]
+    fun Bitmap.toNormalizedFloatArray(inputHeight: Int, inputWidth: Int): FloatArray {
+        // Create a new float array to hold the normalized pixel values
+        val floatValues = FloatArray(inputHeight * inputWidth * 3)
+
+        // Get the dimensions of the bitmap
+        val height = this.height
+        val width = this.width
+
+        // Get the scaling factors for the width and height
+        val widthScale = inputWidth.toFloat() / width
+        val heightScale = inputHeight.toFloat() / height
+
+        // Convert the bitmap to a 32-bit ARGB format
+        val pixels = IntArray(width * height)
+        this.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        // Normalize the pixel values and add them to the float array
+        var index = 0
+        for (y in 0 until inputHeight) {
+            val scaledY = (y / heightScale).toInt()
+            for (x in 0 until inputWidth) {
+                val scaledX = (x / widthScale).toInt()
+                val pixel = pixels[scaledY * width + scaledX]
+
+                floatValues[index++] = ((pixel shr 16 and 0xFF) - IMAGE_MEAN[0]) / IMAGE_STD[0]
+                floatValues[index++] = ((pixel shr 8 and 0xFF) - IMAGE_MEAN[1]) / IMAGE_STD[1]
+                floatValues[index++] = ((pixel and 0xFF) - IMAGE_MEAN[2]) / IMAGE_STD[2]
             }
         }
-        return inputArray
+
+        return floatValues
     }
 }

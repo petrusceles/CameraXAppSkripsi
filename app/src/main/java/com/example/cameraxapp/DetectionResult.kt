@@ -2,8 +2,8 @@ package com.example.cameraxapp
 
 import android.graphics.RectF
 
-data class DetectedObject(
-    val label: String,
+data class DetectionResult(
+    val label: RectF,
     val confidence: Float,
-    val boundingBox: RectF
+    val rect: Float
 )

@@ -1,11 +1,12 @@
 package com.example.cameraxapp
 
+import YOLOv5Detector
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
+import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.Matrix
+import android.graphics.*
 import android.hardware.camera2.CameraCharacteristics
 import android.os.Build
 import android.os.Bundle
@@ -21,6 +22,7 @@ import java.util.concurrent.Executors
 import android.widget.Toast
 import androidx.camera.lifecycle.ProcessCameraProvider
 import android.util.Log
+import android.util.Size
 import android.view.Surface.ROTATION_90
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
@@ -34,12 +36,28 @@ import androidx.camera.video.QualitySelector
 import androidx.camera.video.VideoRecordEvent
 import androidx.core.content.PermissionChecker
 import com.example.cameraxapp.databinding.ActivityMainBinding
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.support.common.ops.NormalizeOp
+import org.tensorflow.lite.support.image.ImageProcessor
+import org.tensorflow.lite.support.image.TensorImage
+import org.tensorflow.lite.support.image.ops.ResizeOp
+import org.tensorflow.lite.support.image.ops.ResizeWithCropOrPadOp
+import java.io.ByteArrayOutputStream
+import java.io.FileInputStream
+import java.lang.Integer.min
 import java.nio.ByteBuffer
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.nio.ByteOrder
+
 
 typealias LumaListener = (luma: Double) -> Unit
 
+
+private val MEAN_RGB = floatArrayOf(0.485f, 0.456f, 0.406f)
+private val STD_RGB = floatArrayOf(0.229f, 0.224f, 0.225f)
 
 class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
@@ -52,6 +70,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
 
     private lateinit var objectDetector: ObjectDetector
+
+    private lateinit var yoloDetector: YOLOv5Detector
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         viewBinding = ActivityMainBinding.inflate(layoutInflater)
@@ -66,7 +86,12 @@ class MainActivity : AppCompatActivity() {
         }
 
 
+        val tfliteModel = loadModelFile(this)
 
+        val interpreter = Interpreter(tfliteModel, Interpreter.Options().apply {
+            setNumThreads(4)
+        })
+        yoloDetector = YOLOv5Detector(interpreter)
         // Set up the listeners for take photo and video capture buttons
         viewBinding.imageCaptureButton.setOnClickListener { takePhoto() }
         viewBinding.videoCaptureButton.setOnClickListener { captureVideo() }
@@ -196,29 +221,19 @@ class MainActivity : AppCompatActivity() {
 
             // Preview
             val preview = Preview.Builder()
-                .setTargetRotation(viewBinding.viewFinder.display.rotation)
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
                 .build()
                 .also {
                     it.setSurfaceProvider(viewBinding.viewFinder.surfaceProvider)
                 }
             imageCapture = ImageCapture.Builder().build()
 
-            val imageAnalyzer =
-                ImageAnalysis.Builder()
-                    .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-                    .setTargetRotation(ROTATION_90)
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setOutputImageFormat(OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .build()
+            val imageAnalyzer = ImageAnalysis.Builder()
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
 
-            imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(this)
-            ) { image ->
-                objectDetector =  ObjectDetector(this,"halo.tflite")
-                val bitmapImage = imageProxyToBitmap(image)
-                val detectionResult: List<DetectedObject> =
-                    objectDetector.detectObjects((bitmapImage))
-                Log.i("Detection Result", detectionResult.toString())
-            }
+            imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(this), yoloDetector)
 
             val selector = QualitySelector
                 .from(
@@ -260,6 +275,82 @@ class MainActivity : AppCompatActivity() {
 
         }, ContextCompat.getMainExecutor(this))
     }
+
+    private fun loadModelFile(context: Context): MappedByteBuffer {
+        val fileDescriptor = context.assets.openFd("person-fp16.tflite")
+        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+        val fileChannel = inputStream.channel
+        val startOffset = fileDescriptor.startOffset
+        val declaredLength = fileDescriptor.declaredLength
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+    }
+
+
+
+    private fun preprocessImage(image: ImageProxy, inputSize: Int): ByteBuffer {
+        val cropSize = min(image.width, image.height)
+        val cropWidth = (image.width - cropSize) / 2
+        val cropHeight = (image.height - cropSize) / 2
+
+        // Convert ImageProxy to Bitmap
+        val bitmap = Bitmap.createBitmap(cropSize, cropSize, Bitmap.Config.ARGB_8888)
+        val nv21Buffer = image.planes[0].buffer
+        val yBuffer = ByteArray(nv21Buffer.remaining())
+        nv21Buffer.get(yBuffer)
+        val uvBuffer = ByteArray(nv21Buffer.remaining())
+        image.planes[2].buffer.get(uvBuffer)
+        val yuvImage = YuvImage(yBuffer, ImageFormat.NV21, cropSize, cropSize, null)
+        val out = ByteArrayOutputStream()
+//        yuvImage.compressToJpeg(Rect(cropWidth, cropHeight, cropWidth + cropSize, cropHeight + cropSize), 100, out)
+        val decodedBitmap = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.toByteArray().size)
+
+        // Create a TensorImage object from the Bitmap
+        var tensorImage = TensorImage.fromBitmap(decodedBitmap)
+
+        // Resize and normalize the image
+        val imageProcessor = ImageProcessor.Builder()
+            .add(ResizeOp(inputSize, inputSize, ResizeOp.ResizeMethod.BILINEAR))
+            .add(NormalizeOp(0f, 255f))
+            .build()
+        tensorImage = imageProcessor.process(tensorImage)
+
+        // Get the ByteBuffer representation of the preprocessed image
+        return tensorImage.buffer
+    }
+
+    // Define the postprocessOutput function
+    private fun postprocessOutput(
+        locations: Array<FloatArray>,
+        classes: FloatArray,
+        scores: FloatArray,
+        count: Float
+    ): List<DetectionResult> {
+        // Define the confidence threshold
+        val confidenceThreshold = 0.5f // Replace with your desired threshold
+
+        // Define the list of detection results
+        val detectionResults = mutableListOf<DetectionResult>()
+
+        // Loop through the output and add detection results with high enough confidence
+        for (i in 0 until count.toInt()) {
+            if (scores[i] >= confidenceThreshold) {
+                val location = locations[i]
+                val ymin = location[0]
+                val xmin = location[1]
+                val ymax = location[2]
+                val xmax = location[3]
+                val rectF = RectF(xmin, ymin, xmax, ymax)
+                detectionResults.add(DetectionResult(rectF, classes[i], scores[i]))
+            }
+        }
+
+        // Return the list of detection results
+        return detectionResults
+    }
+
+
+
+
 
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
         // Get the image's dimensions
